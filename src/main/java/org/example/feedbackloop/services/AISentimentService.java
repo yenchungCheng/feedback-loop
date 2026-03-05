@@ -3,127 +3,131 @@ package org.example.feedbackloop.services;
 import org.example.feedbackloop.models.SentimentAnalysis;
 import org.example.feedbackloop.models.PromptContext;
 import org.example.feedbackloop.repositories.PromptContextRepository;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.data.message.AiMessage;
+import dev.langchain4j.data.message.UserMessage;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.*;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestTemplate;
 
-import java.util.Map;
 import java.util.List;
 import java.util.Optional;
-import java.time.LocalDateTime;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Service
 public class AISentimentService {
-    
-    @Value("${openai.api.key}")
-    private String openaiApiKey;
-    
-    @Value("${openai.api.url:https://api.openai.com/v1/chat/completions}")
-    private String openaiApiUrl;
-    
+
+    @Autowired
+    private ChatLanguageModel chatLanguageModel;
+
     @Autowired
     private PromptContextRepository promptContextRepository;
-    
-    private final RestTemplate restTemplate = new RestTemplate();
-    private final ObjectMapper objectMapper = new ObjectMapper();
-    
-    private static final String DEFAULT_SENTIMENT_PROMPT = 
-        "Analyze the following WhatsApp message and extract:\n" +
-        "1. User Sentiment (POSITIVE, NEGATIVE, NEUTRAL)\n" +
-        "2. Product Interest (HIGH, MEDIUM, LOW, NONE)\n" +
-        "3. Confidence level (0.0-1.0)\n" +
-        "4. Brief reasoning for your analysis\n\n" +
-        "Message: {message}\n\n" +
-        "Respond in JSON format: {\"sentiment\": \"SENTIMENT\", \"productInterest\": \"INTEREST\", \"confidence\": 0.0, \"reasoning\": \"explanation\"}";
-    
+
+    private static final String DEFAULT_SENTIMENT_PROMPT =
+            """
+                    Analyze the following WhatsApp message and extract:
+                    1. User Sentiment (POSITIVE, NEGATIVE, NEUTRAL)
+                    2. Product Interest (HIGH, MEDIUM, LOW, NONE)
+                    3. Confidence level (0.0-1.0)
+                    4. Brief reasoning for your analysis
+                    
+                    Message: {message}
+                    
+                    Respond in JSON format: {"sentiment": "SENTIMENT", "productInterest": "INTEREST", "confidence": 0.0, "reasoning": "explanation"}""";
+
     public SentimentAnalysis analyzeSentiment(String messageContent) {
         try {
-            String prompt = getOptimizedPrompt("SENTIMENT_EXTRACTION", messageContent);
-            String response = callOpenAI(prompt);
+            String prompt = getOptimizedPrompt(messageContent);
+            String response = callAi(prompt);
             return parseSentimentResponse(response);
         } catch (Exception e) {
-            // Fallback to basic analysis
+            System.err.println("Gemini AI analysis failed: " + e.getMessage());
             return createFallbackAnalysis(messageContent);
         }
     }
-    
-    private String getOptimizedPrompt(String contextType, String messageContent) {
+
+    private String getOptimizedPrompt(String messageContent) {
         Optional<PromptContext> optimizedContext = promptContextRepository
-            .findFirstByContextTypeOrderBySuccessRateDesc(contextType);
-        
+                .findFirstByContextTypeOrderBySuccessRateDesc("SENTIMENT_EXTRACTION");
+
         if (optimizedContext.isPresent()) {
             PromptContext context = optimizedContext.get();
             context.incrementUsage();
             promptContextRepository.save(context);
             return context.getImprovedPrompt().replace("{message}", messageContent);
         }
-        
+
         return DEFAULT_SENTIMENT_PROMPT.replace("{message}", messageContent);
     }
-    
-    private String callOpenAI(String prompt) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.setBearerAuth(openaiApiKey);
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        
-        Map<String, Object> requestBody = Map.of(
-            "model", "gpt-3.5-turbo",
-            "messages", List.of(
-                Map.of("role", "system", "content", "You are a sentiment analysis expert for WhatsApp messages."),
-                Map.of("role", "user", "content", prompt)
-            ),
-            "max_tokens", 150,
-            "temperature", 0.3
-        );
-        
-        HttpEntity<Map<String, Object>> entity = new HttpEntity<>(requestBody, headers);
-        
+
+    private String callAi(String prompt) {
         try {
-            ResponseEntity<String> response = restTemplate.postForEntity(openaiApiUrl, entity, String.class);
-            if (response.getStatusCode() == HttpStatus.OK) {
-                return response.getBody();
-            }
+            List<dev.langchain4j.data.message.ChatMessage> messages = List.of(
+                    UserMessage.from("You are a sentiment analysis expert for WhatsApp messages. Always respond in valid JSON format."),
+                    UserMessage.from(prompt)
+            );
+
+            AiMessage response = chatLanguageModel.generate(messages).content();
+            return response.text();
         } catch (Exception e) {
-            System.err.println("OpenAI API call failed: " + e.getMessage());
+            System.err.println("Ai call failed: " + e.getMessage());
+            throw new RuntimeException("Failed to call Ai", e);
         }
-        
-        throw new RuntimeException("Failed to call OpenAI API");
     }
-    
+
     private SentimentAnalysis parseSentimentResponse(String response) {
         try {
-            JsonNode root = objectMapper.readTree(response);
-            JsonNode choices = root.get("choices");
-            if (choices != null && choices.isArray() && choices.size() > 0) {
-                String content = choices.get(0).get("message").get("content").asText();
-                JsonNode analysis = objectMapper.readTree(content);
-                
-                return new SentimentAnalysis(
-                    analysis.get("sentiment").asText(),
-                    analysis.get("productInterest").asText(),
-                    analysis.get("confidence").asDouble(),
-                    analysis.get("reasoning").asText(),
-                    "AI"
-                );
+            // Extract JSON from response (in case there's extra text)
+            Pattern jsonPattern = Pattern.compile("\\{.*}", Pattern.DOTALL);
+            Matcher matcher = jsonPattern.matcher(response);
+
+            if (matcher.find()) {
+                String jsonStr = matcher.group();
+
+                // Parse the JSON manually to avoid Jackson dependency issues
+                String sentiment = extractJsonValue(jsonStr, "sentiment");
+                String productInterest = extractJsonValue(jsonStr, "productInterest");
+                double confidence = extractJsonDouble(jsonStr, "confidence");
+                String reasoning = extractJsonValue(jsonStr, "reasoning");
+
+                return new SentimentAnalysis(sentiment, productInterest, confidence, reasoning, "AI");
             }
         } catch (Exception e) {
-            System.err.println("Failed to parse OpenAI response: " + e.getMessage());
+            System.err.println("Failed to parse Gemini response: " + e.getMessage());
         }
-        
+
         throw new RuntimeException("Failed to parse sentiment response");
     }
-    
+
+    private String extractJsonValue(String json, String key) {
+        Pattern pattern = Pattern.compile("\"" + key + "\"\\s*:\\s*\"([^\"]+)\"");
+        Matcher matcher = pattern.matcher(json);
+        if (matcher.find()) {
+            return matcher.group(1);
+        }
+        return "";
+    }
+
+    private double extractJsonDouble(String json, String key) {
+        Pattern pattern = Pattern.compile("\"" + key + "\"\\s*:\\s*([0-9.]+)");
+        Matcher matcher = pattern.matcher(json);
+        if (matcher.find()) {
+            try {
+                return Double.parseDouble(matcher.group(1));
+            } catch (NumberFormatException e) {
+                return 0.5;
+            }
+        }
+        return 0.5;
+    }
+
     private SentimentAnalysis createFallbackAnalysis(String messageContent) {
         String lowerContent = messageContent.toLowerCase();
         String sentiment = "NEUTRAL";
         String productInterest = "LOW";
         double confidence = 0.5;
         String reasoning = "Fallback analysis due to API failure";
-        
+
         if (lowerContent.contains("love") || lowerContent.contains("great") || lowerContent.contains("awesome")) {
             sentiment = "POSITIVE";
             productInterest = "HIGH";
@@ -135,7 +139,7 @@ public class AISentimentService {
             confidence = 0.7;
             reasoning = "Negative keywords detected";
         }
-        
+
         return new SentimentAnalysis(sentiment, productInterest, confidence, reasoning, "AI_FALLBACK");
     }
 }

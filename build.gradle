@@ -31,8 +31,9 @@ dependencies {
     // For WhatsApp integration (using Twilio as example)
     implementation 'com.twilio.sdk:twilio:9.15.0'
 
-    // For AI integration (OpenAI API)
-    implementation 'io.github.cdimascio:dotenv-java:3.0.0'
+    // LangChain4J with Ollama
+    implementation 'dev.langchain4j:langchain4j-ollama:0.34.0'
+    implementation 'dev.langchain4j:langchain4j:0.34.0'
 
     runtimeOnly 'com.h2database:h2'
     testImplementation 'org.springframework.boot:spring-boot-starter-test'

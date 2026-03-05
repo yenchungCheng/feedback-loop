@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: feedback-loop-mongo
+    command: ["--replSet", "rs0", "--bind_ip_all", "--port", "27017"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: feedback_loop
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  mongo-init:
+    image: mongo:7.0
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    command: >
+      bash -c "
+        sleep 10
+        mongosh --host mongodb:27017 <<EOF
+          var config = {
+            _id: 'rs0',
+            members: [
+              {_id: 0, host: 'localhost:27017'}
+            ]
+          };
+          rs.initiate(config, { force: true });
+        EOF
+      "
+    restart: "no"
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: feedback-loop-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "/bin/ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  ollama-init:
+    image: curlimages/curl:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Pulling gemma2:2b model..."
+        curl -X POST http://ollama:11434/api/pull -d '{"name": "gemma2:2b"}'
+        echo ""
+        echo "Model ready!"
+    restart: "no"
+
+volumes:
+  mongodb_data:
+  ollama_data:
